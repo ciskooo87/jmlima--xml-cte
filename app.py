@@ -45,7 +45,6 @@ def to_float_any(x: str | None) -> float | None:
         return None
 
 def localname(tag: str) -> str:
-    # {namespace}tag -> tag
     if "}" in tag:
         return tag.split("}", 1)[1]
     return tag
@@ -68,9 +67,6 @@ def find_node_anywhere(root: ET.Element, tag_local: str) -> ET.Element | None:
     return None
 
 def find_first_from(node: ET.Element, path_locals: list[str]) -> str | None:
-    """
-    Busca um caminho por localnames ignorando namespace, a partir de um nó.
-    """
     nodes = [node]
     for name in path_locals:
         next_nodes = []
@@ -84,11 +80,6 @@ def find_first_from(node: ET.Element, path_locals: list[str]) -> str | None:
     return normalize_text(nodes[0].text if nodes else None)
 
 def extract_cte_key(xml_bytes: bytes) -> tuple[str, str]:
-    """
-    Retorna (cte_key, method):
-      - method = "chCTe" quando consegue extrair 44 dígitos
-      - method = "hash" quando usa hash do conteúdo
-    """
     try:
         root = ET.fromstring(xml_bytes)
         ch = find_text_anywhere(root, "chCTe")
@@ -99,20 +90,7 @@ def extract_cte_key(xml_bytes: bytes) -> tuple[str, str]:
     return sha256_hex(xml_bytes), "hash"
 
 def extract_fields(xml_bytes: bytes) -> dict:
-    """
-    Extrai:
-      - emit/CNPJ
-      - vPrest/vTPrest
-      - ide/dhEmi (fallback dEmi)
-      - toma/UF (com fallbacks)
-    Ajustado para CT-e real: geralmente em cteProc/CTe/infCte
-    """
-    out = {
-        "emit_cnpj": None,
-        "vTPrest": None,
-        "dhEmi": None,
-        "toma_uf": None,
-    }
+    out = {"emit_cnpj": None, "vTPrest": None, "dhEmi": None, "toma_uf": None}
     try:
         root = ET.fromstring(xml_bytes)
     except ET.ParseError:
@@ -120,17 +98,12 @@ def extract_fields(xml_bytes: bytes) -> dict:
 
     inf = find_node_anywhere(root, "infCte") or root
 
-    # emit/CNPJ (do emitente mesmo)
     out["emit_cnpj"] = normalize_text(find_first_from(inf, ["emit", "CNPJ"]))
-
-    # vPrest/vTPrest (valor total prestação)
     out["vTPrest"] = to_float_any(find_first_from(inf, ["vPrest", "vTPrest"]))
 
-    # dhEmi (ou dEmi em alguns layouts)
     dh = find_first_from(inf, ["ide", "dhEmi"]) or find_first_from(inf, ["ide", "dEmi"])
     out["dhEmi"] = normalize_text(dh)
 
-    # UF do tomador (toma4 ou toma3 ou enderToma). Fallback final: UF do destino.
     uf = (
         find_first_from(inf, ["ide", "toma4", "UF"]) or
         find_first_from(inf, ["ide", "toma3", "toma", "UF"]) or
@@ -143,7 +116,7 @@ def extract_fields(xml_bytes: bytes) -> dict:
 
 
 # =========================================================
-# DB (schema + migração leve)
+# DB
 # =========================================================
 def ensure_db():
     os.makedirs("data", exist_ok=True)
@@ -158,7 +131,6 @@ def ensure_db():
             default_status TEXT
         )
         """)
-
         con.execute("""
         CREATE TABLE IF NOT EXISTS cte (
             cte_key TEXT PRIMARY KEY,
@@ -177,7 +149,6 @@ def ensure_db():
             instituicao_financeira TEXT
         )
         """)
-
         con.execute("""
         CREATE TABLE IF NOT EXISTS batch_items (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -190,8 +161,6 @@ def ensure_db():
             FOREIGN KEY(cte_key) REFERENCES cte(cte_key)
         )
         """)
-
-        # Trilhas de mudança de status (governança real)
         con.execute("""
         CREATE TABLE IF NOT EXISTS status_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -205,7 +174,6 @@ def ensure_db():
             FOREIGN KEY(cte_key) REFERENCES cte(cte_key)
         )
         """)
-
         con.commit()
 
 def upsert_batch(batch_id: str, operator: str | None, notes: str | None, inst: str | None, default_status: str):
@@ -239,14 +207,9 @@ def read_uploaded_files(uploaded_files):
 
 
 # =========================================================
-# Core processing (dedupe + persist)
+# Core processing
 # =========================================================
-def process_lot(
-    batch_id: str,
-    files: list[dict],
-    default_status: str,
-    instituicao_financeira: str | None
-):
+def process_lot(batch_id: str, files: list[dict], default_status: str, instituicao_financeira: str | None):
     results = []
     now = utc_now_iso()
 
@@ -261,7 +224,6 @@ def process_lot(
             cte_key, method = extract_cte_key(raw)
             src_hash = sha256_hex(raw)
             filename = f["filename"]
-
             fields = extract_fields(raw)
 
             row = con.execute("SELECT * FROM cte WHERE cte_key = ?", (cte_key,)).fetchone()
@@ -286,7 +248,6 @@ def process_lot(
                     ),
                 )
 
-                # log status inicial
                 con.execute(
                     """
                     INSERT INTO status_events (cte_key, event_at_utc, operator, from_status, to_status, reason, related_batch_id)
@@ -316,7 +277,6 @@ def process_lot(
                 })
 
             else:
-                # duplicado: apenas atualiza last_seen e registra no lote
                 con.execute(
                     """
                     UPDATE cte
@@ -407,13 +367,11 @@ def get_cte(cte_key: str):
 def update_status(cte_keys: list[str], new_status: str, operator: str | None, reason: str | None):
     if not cte_keys:
         return 0
-
     now = utc_now_iso()
 
     with sqlite3.connect(DB_PATH) as con:
         con.row_factory = sqlite3.Row
 
-        # pega status atual por chave
         q_marks = ",".join(["?"] * len(cte_keys))
         current = con.execute(
             f"SELECT cte_key, status FROM cte WHERE cte_key IN ({q_marks})",
@@ -421,11 +379,9 @@ def update_status(cte_keys: list[str], new_status: str, operator: str | None, re
         ).fetchall()
         current_map = {r["cte_key"]: r["status"] for r in current}
 
-        # aplica update
         params = [new_status] + cte_keys
         cur = con.execute(f"UPDATE cte SET status = ? WHERE cte_key IN ({q_marks})", params)
 
-        # audit trail
         for k in cte_keys:
             con.execute(
                 """
@@ -474,7 +430,7 @@ st.set_page_config(page_title=APP_TITLE, layout="wide")
 ensure_db()
 
 st.title(APP_TITLE)
-st.caption("Upload XML/ZIP → extração de campos → dedupe → histórico + workflow (PENDENTE/OPERADO/CANCELADO) + instituição financeira.")
+st.caption("Upload XML/ZIP → extração → dedupe → histórico + workflow + instituição financeira.")
 
 with st.sidebar:
     st.subheader("Parâmetros operacionais")
@@ -600,10 +556,24 @@ else:
 
     st.markdown("### Ações massivas")
 
-    # seleção por chave (sem “limitar 50” — isso era ruim)
+    all_keys = df_cte["cte_key"].tolist()
+
+    # --- Selecionar tudo: controla o multiselect via session_state
+    if "selected_keys" not in st.session_state:
+        st.session_state.selected_keys = []
+
+    select_all = st.checkbox("Selecionar tudo (do filtro atual)", value=False)
+
+    if select_all:
+        st.session_state.selected_keys = all_keys
+    else:
+        # se desmarcar, não zera automaticamente (evita perda acidental)
+        pass
+
     keys_to_change = st.multiselect(
-        "Selecione CT-e (pode buscar/filtrar e selecionar vários)",
-        options=df_cte["cte_key"].tolist()
+        "CT-e selecionados",
+        options=all_keys,
+        key="selected_keys"
     )
 
     a1, a2 = st.columns([1, 2])
@@ -612,21 +582,32 @@ else:
     with a2:
         reason = st.text_input("Motivo (auditoria)", value="atualização operacional")
 
-    if st.button("Aplicar novo status", disabled=not keys_to_change):
-        changed = update_status(keys_to_change, new_status, operator.strip() or None, reason.strip() or None)
-        st.success(f"Atualizados: {changed} CT-e → {new_status}.")
-        st.warning(
-            "Atenção: se você filtrou por status, os CT-e podem SUMIR da tabela após a mudança "
-            "(porque agora pertencem a outro status). Isso é esperado."
-        )
+    b1, b2 = st.columns([2, 1])
+    with b1:
+        new_inst = st.text_input("Nova instituição (para os selecionados)", value="")
+    with b2:
+        st.write("")  # spacing
 
-    st.divider()
-    st.markdown("### Atualizar instituição financeira (massivo)")
-    new_inst = st.text_input("Nova instituição para os selecionados", value="")
-    if st.button("Aplicar instituição", disabled=not keys_to_change):
-        changed = update_instituicao(keys_to_change, new_inst.strip() or None)
-        st.success(f"Atualizados: {changed} CT-e com instituição '{new_inst.strip() or None}'.")
+    col_btn1, col_btn2, col_btn3 = st.columns([1, 1, 1])
 
+    with col_btn1:
+        if st.button("Aplicar novo status", disabled=not keys_to_change):
+            changed = update_status(keys_to_change, new_status, operator.strip() or None, reason.strip() or None)
+            st.success(f"Atualizados: {changed} CT-e → {new_status}.")
+            st.warning(
+                "Se você filtrou por status, CT-e podem sumir da tabela após a mudança (é esperado). "
+                "Use '(todos)' para ver geral."
+            )
+
+    with col_btn2:
+        if st.button("Aplicar instituição", disabled=not keys_to_change):
+            changed = update_instituicao(keys_to_change, new_inst.strip() or None)
+            st.success(f"Atualizados: {changed} CT-e com instituição '{new_inst.strip() or None}'.")
+
+    with col_btn3:
+        if st.button("Limpar seleção", disabled=not keys_to_change):
+            st.session_state.selected_keys = []
+            st.success("Seleção limpa.")
 
 st.divider()
 st.subheader("4) Auditoria de status (por CT-e)")
@@ -639,5 +620,5 @@ if audit_key.strip():
         st.dataframe(ev, use_container_width=True, hide_index=True)
 
 st.caption(
-    "Nota: SQLite no Streamlit Cloud funciona para MVP. Se isso virar missão crítica, o caminho certo é Postgres externo (Neon/Supabase) para persistência e concorrência."
+    "Nota: SQLite no Streamlit Cloud funciona para MVP. Para missão crítica/concorrência, Postgres externo é o caminho certo."
 )
